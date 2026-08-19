@@ -1,14 +1,15 @@
-# Автоматический поиск актуального ID образа Ubuntu 24.04 LTS
+# ==============================================================================
+# 1. СЕТЕВАЯ ИНФРАСТРУКТУРА
+# ==============================================================================
+
 data "yandex_compute_image" "ubuntu_2404" {
   family = "ubuntu-2404-lts"
 }
 
-# 1. Создание пустой VPC
 resource "yandex_vpc_network" "homework_vpc" {
   name = var.vpc_name
 }
 
-# 2. ПУБЛИЧНАЯ ПОДСЕТЬ
 resource "yandex_vpc_subnet" "public_subnet" {
   name           = "public"
   zone           = var.default_zone
@@ -16,116 +17,162 @@ resource "yandex_vpc_subnet" "public_subnet" {
   v4_cidr_blocks = ["192.168.10.0/24"]
 }
 
-# 3. NAT-инстанс в публичной подсети
-resource "yandex_compute_instance" "nat_instance" {
-  name        = "nat-instance"
-  zone        = var.default_zone
-  platform_id = "standard-v3"
+# ==============================================================================
+# 2. СЕРВИСНЫЙ АККАУНТ ДЛЯ ГРУППЫ ВМ
+# ==============================================================================
 
-  resources {
-    cores         = var.storage_resources.cores
-    memory        = var.storage_resources.memory
-    core_fraction = var.storage_resources.core_fraction
+resource "yandex_iam_service_account" "sa_ig" {
+  name = "sa-instance-group-clean"
+}
+
+resource "yandex_resourcemanager_folder_iam_member" "sa_ig_editor" {
+  folder_id = var.folder_id
+  role      = "editor"
+  member    = "serviceAccount:${yandex_iam_service_account.sa_ig.id}"
+}
+
+resource "yandex_resourcemanager_folder_iam_member" "sa_ig_vpc" {
+  folder_id = var.folder_id
+  role      = "vpc.user"
+  member    = "serviceAccount:${yandex_iam_service_account.sa_ig.id}"
+}
+
+# ==============================================================================
+# 3. COMPUTE INSTANCE GROUP (ГРУППА ВМ)
+# ==============================================================================
+
+resource "yandex_compute_instance_group" "lamp_group" {
+  name               = "lamp-instance-group"
+  folder_id          = var.folder_id
+  service_account_id = yandex_iam_service_account.sa_ig.id
+
+  depends_on = [
+    yandex_resourcemanager_folder_iam_member.sa_ig_editor,
+    yandex_resourcemanager_folder_iam_member.sa_ig_vpc
+  ]
+
+  load_balancer {
+    target_group_name        = "nlb-target-group"
+    target_group_description = "Target group for network load balancer"
   }
 
-  boot_disk {
-    initialize_params {
-      image_id = "fd80mrhj8fl2oe87o4e1" # Специальный образ NAT от Yandex Cloud
+  allocation_policy {
+    zones = [var.default_zone]
+  }
+
+  deploy_policy {
+    max_unavailable = 1
+    max_creating    = 3
+    max_expansion   = 1
+    max_deleting    = 1
+  }
+
+  scale_policy {
+    fixed_scale {
+      size = 3
     }
   }
 
-  network_interface {
-    subnet_id  = yandex_vpc_subnet.public_subnet.id
-    ip_address = "192.168.10.254" # Фиксированный IP по ТЗ
-    nat        = true             # Публичный IP для выхода в интернет
-  }
+  instance_template {
+    name     = "lamp-web-server-{instance.index}"
+    hostname = "lamp-web-server-{instance.index}"
 
-  metadata = {
-    ssh-keys = "ubuntu:${file("~/.ssh/id_ed25519.pub")}"
-  }
-}
+    platform_id = "standard-v3"
+    resources {
+      core_fraction = var.storage_resources.core_fraction
+      cores         = var.storage_resources.cores
+      memory        = var.storage_resources.memory
+    }
 
-# 4. Публичная ВМ для проверки доступа
-resource "yandex_compute_instance" "public_vm" {
-  name        = "public-vm"
-  zone        = var.default_zone
-  platform_id = "standard-v3"
+    boot_disk {
+      mode = "READ_WRITE"
+      initialize_params {
+        image_id = "fd827b91d99psvq5fjit"
+        size     = 15
+      }
+    }
 
-  resources {
-    cores         = var.storage_resources.cores
-    memory        = var.storage_resources.memory
-    core_fraction = var.storage_resources.core_fraction
-  }
+    network_interface {
+      network_id = yandex_vpc_network.homework_vpc.id
+      subnet_ids = [yandex_vpc_subnet.public_subnet.id]
+      nat        = true 
+    }
 
-  boot_disk {
-    initialize_params {
-      image_id = data.yandex_compute_image.ubuntu_2404.id # Динамический поиск образа
+    metadata = {
+      ssh-keys  = "ubuntu:${file("~/.ssh/id_ed25519.pub")}"
+      
+      # ВСТАВЛЕНО: Ваша новая прямая интернет-ссылка на картинку в бакете dgv
+      user-data = <<EOF
+#!/bin/bash
+echo '<!DOCTYPE html>
+<html>
+<head>
+    <title>Netology Homework 15.2</title>
+    <meta charset="utf-8">
+</head>
+<body>
+    <h1>Hello from Netology LAMP Instance Group!</h1>
+    <p>Image dynamically loaded from Object Storage:</p>
+    <img src="https://storage.yandexcloud.net/dgv/picture.jpg" alt="Netology Image" width="600">
+</body>
+</html>' > /var/www/html/index.html
+
+systemctl restart apache2
+EOF
     }
   }
 
-  network_interface {
-    subnet_id = yandex_vpc_subnet.public_subnet.id
-    nat       = true # Нужен по ТЗ для прямой проверки интернета
-  }
-
-  metadata = {
-    ssh-keys = "ubuntu:${file("~/.ssh/id_ed25519.pub")}"
-  }
-}
-
-# 5. ПРИВАТНАЯ ПОДСЕТЬ
-resource "yandex_vpc_subnet" "private_subnet" {
-  name           = "private"
-  zone           = var.default_zone
-  network_id     = yandex_vpc_network.homework_vpc.id
-  v4_cidr_blocks = ["192.168.20.0/24"]
-  route_table_id = yandex_vpc_route_table.private_rt.id # Привязка таблицы маршрутизации
-}
-
-# 6. Таблица маршрутизации (Route Table) для приватной сети
-resource "yandex_vpc_route_table" "private_rt" {
-  name       = "private-route-table"
-  network_id = yandex_vpc_network.homework_vpc.id
-
-  static_route {
-    destination_prefix = "0.0.0.0/0"                                      # Весь исходящий трафик
-    next_hop_address   = yandex_compute_instance.nat_instance.network_interface[0].ip_address # Исправленный индекс
+  health_check {
+    interval            = 10
+    timeout             = 2
+    unhealthy_threshold = 3
+    healthy_threshold   = 2
+    http_options {
+      port = 80
+      path = "/"
+    }
   }
 }
 
-# 7. Приватная ВМ
-resource "yandex_compute_instance" "private_vm" {
-  name        = "private-vm"
-  zone        = var.default_zone
-  platform_id = "standard-v3"
+# ==============================================================================
+# 4. NETWORK LOAD BALANCER (БАЛАНСИРОВЩИК ТРАФИКА)
+# ==============================================================================
 
-  resources {
-    cores         = var.storage_resources.cores
-    memory        = var.storage_resources.memory
-    core_fraction = var.storage_resources.core_fraction
-  }
+resource "yandex_lb_network_load_balancer" "main_nlb" {
+  name = "network-load-balancer"
 
-  boot_disk {
-    initialize_params {
-      image_id = data.yandex_compute_image.ubuntu_2404.id # Динамический поиск образа
+  listener {
+    name = "http-listener"
+    port = 80
+    external_address_spec {
+      ip_version = "ipv4"
     }
   }
 
-  network_interface {
-    subnet_id = yandex_vpc_subnet.private_subnet.id
-    nat       = false # Строго FALSE (нет публичного IP)
-  }
+  attached_target_group {
+    # СТУДЕНЧЕСКИЙ ИСПРАВЛЕННЫЙ СИНТАКСИС: Добавлен обязательный индекс [0]
+    target_group_id = yandex_compute_instance_group.lamp_group.load_balancer[0].target_group_id
 
-  metadata = {
-    ssh-keys = "ubuntu:${file("~/.ssh/id_ed25519.pub")}"
+    # Слитное написание специально под вашу версию провайдера
+    healthcheck {
+      name                = "http-health-check"
+      interval            = 5
+      timeout             = 2
+      unhealthy_threshold = 3
+      healthy_threshold   = 2
+      http_options {
+        port = 80
+        path = "/"
+      }
+    }
   }
 }
 
-# Вывод IP-адресов после развертывания в консоль
-output "public_vm_external_ip" {
-  value = yandex_compute_instance.public_vm.network_interface[0].nat_ip_address # Исправленный индекс
-}
+# ==============================================================================
+# 5. OUTPUTS (ВЫВОД IP АДРЕСА)
+# ==============================================================================
 
-output "private_vm_internal_ip" {
-  value = yandex_compute_instance.private_vm.network_interface[0].ip_address # Исправленный индекс
+output "balancer_public_ip" {
+  value       = yandex_lb_network_load_balancer.main_nlb.listener
+  description = "Параметры слушателя балансировщика трафика (включая IP-адрес)"
 }
