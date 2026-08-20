@@ -18,7 +18,7 @@ resource "yandex_vpc_subnet" "public_subnet" {
 }
 
 # ==============================================================================
-# 2. СЕРВИСНЫЙ АККАУНТ ДЛЯ ГРУППЫ ВМ
+# 2. СЕРВИСНЫЙ АККАУНТ И ПРАВА ДОСТУПА (ДОРАБОТАНО)
 # ==============================================================================
 
 resource "yandex_iam_service_account" "sa_ig" {
@@ -37,8 +37,52 @@ resource "yandex_resourcemanager_folder_iam_member" "sa_ig_vpc" {
   member    = "serviceAccount:${yandex_iam_service_account.sa_ig.id}"
 }
 
+# ВСТАВЛЕНО: Роль для шифрования и расшифрования объектов в бакете с помощью KMS
+resource "yandex_resourcemanager_folder_iam_member" "sa_ig_kms" {
+  folder_id = var.folder_id
+  role      = "kms.editor"
+  member    = "serviceAccount:${yandex_iam_service_account.sa_ig.id}"
+}
+
 # ==============================================================================
-# 3. COMPUTE INSTANCE GROUP (ГРУППА ВМ)
+# [НОВОЕ] 3. KMS КЛЮЧ И КРИПТОГРАФИЯ
+# ==============================================================================
+
+resource "yandex_kms_symmetric_key" "dgv_key" {
+  name              = "dgv"
+  description       = "Ключ KMS для шифрования содержимого бакета dgv"
+  default_algorithm = "AES_256"
+  rotation_period   = "8760h"
+}
+
+# ==============================================================================
+# [НОВОЕ] 4. YANDEX OBJECT STORAGE С ШИФРОВАНИЕМ KMS
+# ==============================================================================
+
+# Создаем статический ключ доступа, необходимый для создания бакета через Terraform
+resource "yandex_iam_service_account_static_access_key" "sa_static_key" {
+  service_account_id = yandex_iam_service_account.sa_ig.id
+  description        = "Статический ключ для работы с Object Storage"
+}
+
+resource "yandex_storage_bucket" "dgv_bucket" {
+  bucket     = "dgv"
+  access_key = yandex_iam_service_account_static_access_key.sa_static_key.access_key
+  secret_key = yandex_iam_service_account_static_access_key.sa_static_key.secret_key
+
+  # Блок конфигурации серверного шифрования (KMS)
+  server_side_encryption_configuration {
+    rule {
+      apply_server_side_encryption_by_default {
+        kms_master_key_id = yandex_kms_symmetric_key.dgv_key.id
+        sse_algorithm     = "aws:kms"
+      }
+    }
+  }
+}
+
+# ==============================================================================
+# 5. COMPUTE INSTANCE GROUP (ГРУППА ВМ)
 # ==============================================================================
 
 resource "yandex_compute_instance_group" "lamp_group" {
@@ -48,7 +92,8 @@ resource "yandex_compute_instance_group" "lamp_group" {
 
   depends_on = [
     yandex_resourcemanager_folder_iam_member.sa_ig_editor,
-    yandex_resourcemanager_folder_iam_member.sa_ig_vpc
+    yandex_resourcemanager_folder_iam_member.sa_ig_vpc,
+    yandex_resourcemanager_folder_iam_member.sa_ig_kms
   ]
 
   load_balancer {
@@ -101,7 +146,6 @@ resource "yandex_compute_instance_group" "lamp_group" {
     metadata = {
       ssh-keys  = "ubuntu:${file("~/.ssh/id_ed25519.pub")}"
       
-      # ВСТАВЛЕНО: Ваша новая прямая интернет-ссылка на картинку в бакете dgv
       user-data = <<EOF
 #!/bin/bash
 echo '<!DOCTYPE html>
@@ -135,7 +179,7 @@ EOF
 }
 
 # ==============================================================================
-# 4. NETWORK LOAD BALANCER (БАЛАНСИРОВЩИК ТРАФИКА)
+# 6. NETWORK LOAD BALANCER (БАЛАНСИРОВЩИК ТРАФИКА)
 # ==============================================================================
 
 resource "yandex_lb_network_load_balancer" "main_nlb" {
@@ -150,10 +194,8 @@ resource "yandex_lb_network_load_balancer" "main_nlb" {
   }
 
   attached_target_group {
-    # СТУДЕНЧЕСКИЙ ИСПРАВЛЕННЫЙ СИНТАКСИС: Добавлен обязательный индекс [0]
     target_group_id = yandex_compute_instance_group.lamp_group.load_balancer[0].target_group_id
 
-    # Слитное написание специально под вашу версию провайдера
     healthcheck {
       name                = "http-health-check"
       interval            = 5
@@ -169,7 +211,7 @@ resource "yandex_lb_network_load_balancer" "main_nlb" {
 }
 
 # ==============================================================================
-# 5. OUTPUTS (ВЫВОД IP АДРЕСА)
+# 7. OUTPUTS (ВЫВОД IP АДРЕСА)
 # ==============================================================================
 
 output "balancer_public_ip" {
